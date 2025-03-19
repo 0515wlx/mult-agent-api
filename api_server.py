@@ -40,8 +40,24 @@ def delete_cache(cache_id: str) -> bool:
 
 # 加载模型和tokenizer
 model_path = "huggingface_model/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
-tokenizer = AutoTokenizer.from_pretrained(model_path)
-model = AutoModelForCausalLM.from_pretrained(model_path, device_map="auto")
+
+# 先加载模型
+model = AutoModelForCausalLM.from_pretrained(
+    model_path,
+    device_map="auto")
+
+# 然后加载tokenizer，确保配置与模型兼容
+tokenizer = AutoTokenizer.from_pretrained(
+    model_path,
+    pad_token=' ',
+    padding_side='left',
+    truncation_side='left',
+    model_max_length=model.config.max_position_embeddings
+)
+
+# 设置模型的pad_token_id和eos_token_id
+model.config.pad_token_id = tokenizer.pad_token_id
+model.config.eos_token_id = tokenizer.eos_token_id
 
 @app.route('/v1/completions', methods=['POST'])
 def generate_completion():
@@ -153,105 +169,121 @@ def generate_completion_sync():
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
     
     # 获取所有输入缓存
-    input_caches = []
-    for cache_id in input_cache_ids:
-        cache = get_cache(cache_id)
-        if cache:
-            input_caches.append(cache)
-    
-    # 合并所有输入缓存的input_kv_cache（带类型检查和空值处理）
     past_key_values = None
-    if input_caches:
-        valid_caches = [c['input_kv_cache'] for c in input_caches if c and c['input_kv_cache']]
-        if valid_caches:
-            # 确保所有缓存的层数和形状一致
-            num_layers = len(valid_caches[0])
-            for cache in valid_caches[1:]:
-                if len(cache) != num_layers:
-                    raise ValueError("Mismatched number of layers in input caches")
+    if input_cache_ids:
+        input_caches = []
+        for cache_id in input_cache_ids:
+            cache = get_cache(cache_id)
+            if cache and cache.get('input_kv_cache'):
+                input_caches.append(cache['input_kv_cache'])
 
-            # 按层合并key和value
-            merged_cache = []
-            for layer_idx in range(num_layers):
-                keys = [cache[layer_idx][0] for cache in valid_caches]
-                values = [cache[layer_idx][1] for cache in valid_caches]
-                merged_key = torch.cat(keys, dim=0)
-                merged_value = torch.cat(values, dim=0)
-                merged_cache.append((merged_key, merged_value))
-            past_key_values = tuple(merged_cache)
-    
+        # 合并缓存（仅当所有缓存结构一致时）
+        if input_caches:
+            try:
+                # 检查所有缓存的层数和形状是否一致
+                num_layers = len(input_caches[0])
+                for cache in input_caches[1:]:
+                    if len(cache) != num_layers:
+                        raise ValueError("缓存层数不一致")
+                    for i in range(num_layers):
+                        if cache[i][0].shape != input_caches[0][i][0].shape:
+                            raise ValueError(f"第{i}层key形状不一致")
+                        if cache[i][1].shape != input_caches[0][i][1].shape:
+                            raise ValueError(f"第{i}层value形状不一致")
+
+                # 按层合并key和value
+                merged_cache = []
+                for layer_idx in range(num_layers):
+                    keys = [cache[layer_idx][0] for cache in input_caches]
+                    values = [cache[layer_idx][1] for cache in input_caches]
+                    merged_key = torch.cat(keys, dim=2)  # 在序列维度合并
+                    merged_value = torch.cat(values, dim=2)
+                    merged_cache.append((merged_key, merged_value))
+                past_key_values = tuple(merged_cache)
+            except Exception as e:
+                return jsonify({
+                    'error': '缓存合并失败',
+                    'message': str(e),
+                    'status_code': 400
+                }), 400
+
     with torch.no_grad():
-        # 检查输入长度
+        # 输入校验
         if not hasattr(inputs, 'input_ids') or inputs.input_ids.nelement() == 0:
-            return jsonify({
-                'error': 'Input text is empty',
-                'status_code': 400
-            }), 400
-        
-        # 处理空缓存情况，初始化默认past_key_values
-        if past_key_values is None:
-            past_key_values = tuple([(None, None)] * model.config.num_hidden_layers)
-        elif not isinstance(past_key_values, tuple):
-            past_key_values = tuple(past_key_values)
-        
-        # 初始化attention_mask
-        if inputs.attention_mask is None:
-            inputs.attention_mask = torch.ones_like(inputs.input_ids)
-        
-        # 添加序列长度校验
+            return jsonify({'error': '输入文本为空', 'status_code': 400}), 400
+
         if inputs.input_ids.size(1) > model.config.max_position_embeddings:
             return jsonify({
-                'error': 'Input length exceeds model maximum capacity',
+                'error': '输入长度超过模型限制',
                 'max_length': model.config.max_position_embeddings,
                 'status_code': 400
             }), 400
-        
+
         try:
-            # 检查past_key_values的维度
-            if past_key_values is not None:
-                for layer in past_key_values:
-                    if len(layer) != 2:
-                        raise ValueError("Invalid past_key_values format")
-            
-            # 添加cache_position处理并检查边界
-            seq_length = inputs.input_ids.size(1)
-            cache_position = torch.arange(
-                seq_length,
-                device=inputs.input_ids.device
-            )
-            
+            # 生成配置
+            generation_config = {
+                "max_new_tokens": max_tokens,
+                "temperature": temperature,
+                "do_sample": True,
+                "past_key_values": past_key_values,
+                "attention_mask": inputs.attention_mask,
+                "use_cache": True,
+                "pad_token_id": tokenizer.pad_token_id,
+                "eos_token_id": tokenizer.eos_token_id,
+                "repetition_penalty": 1.1,
+                "top_p": 0.9,
+                "top_k": 50
+            }
+
+            # 执行生成
             outputs = model.generate(
                 inputs.input_ids,
-                max_length=max_tokens,
-                temperature=temperature,
-                do_sample=True,
-                past_key_values=past_key_values,
-                attention_mask=inputs.attention_mask,
-                cache_position=cache_position,
-                use_cache=True
+                **generation_config
             )
         except Exception as e:
-            return jsonify({
-                'error': 'Generation failed',
-                'message': str(e),
-                'details': {
-                    'input_length': inputs.input_ids.size(1) if hasattr(inputs, 'input_ids') else 0,
-                    'past_key_values_shape': str([(k.shape, v.shape) for (k, v) in past_key_values]) if past_key_values else None
+            # 记录详细错误日志
+            import traceback
+            error_details = {
+                'input_text': prompt,
+                'input_cache_ids': input_cache_ids,
+                'input_length': inputs.input_ids.size(1) if hasattr(inputs, 'input_ids') else 0,
+                'past_key_values_shape': str([(k.shape if k else None, v.shape if v else None) for (k, v) in past_key_values]) if past_key_values else None,
+                'model_config': {
+                    'max_position_embeddings': model.config.max_position_embeddings,
+                    'num_hidden_layers': model.config.num_hidden_layers
                 },
+                'stack_trace': traceback.format_exc()
+            }
+            app.logger.error("Generation failed with details: %s", error_details)
+            
+            return jsonify({
+                'error': '生成失败',
+                'message': str(e),
+                'details': error_details,
                 'status_code': 500
             }), 500
         else:
-            # 确保past_key_values格式正确
-            if not isinstance(past_key_values, tuple):
-                past_key_values = tuple(past_key_values)
-            
             # 初始化attention_mask
             if inputs.attention_mask is None:
                 inputs.attention_mask = torch.ones_like(inputs.input_ids)
-            
+                
             try:
-                # 确保past_key_values格式正确
-                if past_key_values is not None:
+                # 检查输入序列长度
+                seq_length = inputs.input_ids.size(1)
+                if seq_length == 0:
+                    raise ValueError("Input sequence length cannot be zero")
+                
+                # 初始化cache_position
+                cache_position = torch.arange(
+                    seq_length,
+                    device=inputs.input_ids.device
+                )
+                
+                # 如果past_key_values为None，设置为None
+                if past_key_values is None:
+                    past_key_values = None
+                else:
+                    # 确保past_key_values格式正确
                     if not isinstance(past_key_values, tuple):
                         past_key_values = tuple(past_key_values)
                     
@@ -259,16 +291,6 @@ def generate_completion_sync():
                     for layer in past_key_values:
                         if len(layer) != 2:
                             raise ValueError("Invalid past_key_values format")
-                
-                # 添加cache_position处理并检查边界
-                seq_length = inputs.input_ids.size(1)
-                if seq_length == 0:
-                    raise ValueError("Input sequence length cannot be zero")
-                
-                cache_position = torch.arange(
-                    seq_length,
-                    device=inputs.input_ids.device
-                )
                 
                 outputs = model.generate(
                     inputs.input_ids,

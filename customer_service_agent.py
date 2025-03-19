@@ -10,10 +10,11 @@ class CustomerServiceAgent:
         self.cache_map: Dict[str, str] = {}  # 缓存映射：角色 -> cache_id
         
         # 初始化各角色的缓存
-        self._init_cache("客服主管", CUSTOMER_SERVICE_SOP)
-        self._init_cache("技术支持", "技术支持相关知识和流程")
-        self._init_cache("账单客服", "账单和支付相关问题处理流程") 
-        self._init_cache("产品顾问", "产品功能和选型相关知识")
+        # 使用简化的初始化文本避免特殊字符问题
+        self._init_cache("客服主管", "客户服务标准操作流程")
+        self._init_cache("技术支持", "技术故障排除指南")
+        self._init_cache("账单客服", "支付和账单处理规范")
+        self._init_cache("产品顾问", "产品规格说明文档")
 
     def _init_cache(self, role: str, context: str, max_retries: int = 3) -> str:
         """初始化角色缓存，带重试机制"""
