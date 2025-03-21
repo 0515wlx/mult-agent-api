@@ -219,6 +219,33 @@ def generate_completion_sync():
                 'status_code': 400
             }), 400
 
+        # 初始化past_key_values
+        if past_key_values is None:
+            past_key_values = tuple([(None, None)] * model.config.num_hidden_layers)
+        elif isinstance(past_key_values, list):
+            past_key_values = tuple(past_key_values)
+            
+        # 验证past_key_values形状
+        if past_key_values is not None:
+            if len(past_key_values) != model.config.num_hidden_layers:
+                return jsonify({
+                    'error': 'past_key_values层数与模型不匹配',
+                    'expected_layers': model.config.num_hidden_layers,
+                    'actual_layers': len(past_key_values),
+                    'status_code': 400
+                }), 400
+
+            for layer_idx, (k, v) in enumerate(past_key_values):
+                if k is not None and v is not None:
+                    if k.dim() != 4 or v.dim() != 4:
+                        return jsonify({
+                            'error': f'第{layer_idx}层past_key_values维度错误',
+                            'expected_dim': 4,
+                            'key_dim': k.dim(),
+                            'value_dim': v.dim(),
+                            'status_code': 400
+                        }), 400
+
         try:
             # 生成配置
             generation_config = {
@@ -235,10 +262,33 @@ def generate_completion_sync():
                 "top_k": 50
             }
 
+            # 准备输入
+            model_inputs = model.prepare_inputs_for_generation(
+                inputs.input_ids,
+                past_key_values=past_key_values,
+                attention_mask=inputs.attention_mask,
+                use_cache=True
+            )
+            
+            # 验证cache_position
+            if 'cache_position' in model_inputs:
+                if model_inputs['cache_position'].size(0) == 0:
+                    model_inputs['cache_position'] = torch.arange(
+                        inputs.input_ids.size(1),
+                        device=inputs.input_ids.device
+                    )
+            
             # 执行生成
             outputs = model.generate(
-                inputs.input_ids,
-                **generation_config
+                **model_inputs,
+                max_new_tokens=max_tokens,
+                temperature=temperature,
+                do_sample=True,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+                repetition_penalty=1.1,
+                top_p=0.9,
+                top_k=50
             )
         except Exception as e:
             # 记录详细错误日志
@@ -292,15 +342,33 @@ def generate_completion_sync():
                         if len(layer) != 2:
                             raise ValueError("Invalid past_key_values format")
                 
-                outputs = model.generate(
+                # 准备输入
+                model_inputs = model.prepare_inputs_for_generation(
                     inputs.input_ids,
-                    max_length=max_tokens,
-                    temperature=temperature,
-                    do_sample=True,
                     past_key_values=past_key_values,
                     attention_mask=inputs.attention_mask,
-                    cache_position=cache_position,
                     use_cache=True
+                )
+                
+                # 验证cache_position
+                if 'cache_position' in model_inputs:
+                    if model_inputs['cache_position'].size(0) == 0:
+                        model_inputs['cache_position'] = torch.arange(
+                            inputs.input_ids.size(1),
+                            device=inputs.input_ids.device
+                        )
+                
+                # 执行生成
+                outputs = model.generate(
+                    **model_inputs,
+                    max_new_tokens=max_tokens,
+                    temperature=temperature,
+                    do_sample=True,
+                    pad_token_id=tokenizer.pad_token_id,
+                    eos_token_id=tokenizer.eos_token_id,
+                    repetition_penalty=1.1,
+                    top_p=0.9,
+                    top_k=50
                 )
             except Exception as e:
                 return jsonify({
